@@ -1,334 +1,670 @@
-import pandas as pd
+import os
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+from astropy import units as u
 from astropy.coordinates import SkyCoord
-import astropy.units as u
-from scipy import stats
-import warnings
 
-warnings.filterwarnings('ignore')
-np.random.seed(42)  # 可复现性
+# ======================================
+# 全局画图风格
+# ======================================
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.size': 12,
+    'axes.linewidth': 1.5,
+    'xtick.direction': 'in',
+    'ytick.direction': 'in',
+    'xtick.major.size': 6,
+    'ytick.major.size': 6,
+    'savefig.dpi': 300
+})
 
-# ==========================================
-# 1. 数据加载与清洗（含距离修正）
-# ==========================================
-def load_and_clean_data(filepath):
-    print(f">>> Loading data from {filepath}...")
-    try:
-        df = pd.read_csv(filepath, sep=',', engine='python', skipinitialspace=True)
-        df.columns = [c.strip() for c in df.columns]
-        df = df.dropna(axis=1, how='all')
-    except Exception as e:
-        print(f"Error reading file: {e}")
+# ======================================
+# 常数
+# ======================================
+DIST_PC = 136.2
+K_CONV = 4.74047 * (DIST_PC / 1000.0)   # mas/yr -> km/s
+
+
+# ======================================
+# 1. 数据读取与预处理
+# ======================================
+def load_and_preprocess(all_csv, binary_txt,
+                        cluster_center_ra=56.75, cluster_center_dec=24.11):
+    print("[Step 1] Loading and preprocessing base data...")
+    df = pd.read_csv(all_csv)
+
+    required_cols = ['source_id', 'ra', 'dec', 'parallax', 'pmra', 'pmdec']
+    for c in required_cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}")
+
+    # ---- 读 photometric binary list ----
+    with open(binary_txt, 'r') as f:
+        lines = f.readlines()
+
+    binary_ids = []
+    for l in lines:
+        parts = l.split()
+        if len(parts) == 0:
+            continue
+        if parts[0].isdigit() and len(parts[0]) >= 18:
+            binary_ids.append(parts[0])
+    binary_ids = set(binary_ids)
+
+    df = df.dropna(subset=required_cols).copy()
+    df['source_id_str'] = df['source_id'].astype(str)
+    df['is_phot_binary'] = df['source_id_str'].isin(binary_ids)
+
+    if 'ruwe' not in df.columns:
+        df['ruwe'] = 1.0
+    df['ruwe'] = df['ruwe'].fillna(1.0)
+
+    if 'pmra_error' in df.columns:
+        df['pmra_error'] = df['pmra_error'].fillna(df['pmra_error'].median())
+    else:
+        df['pmra_error'] = 0.05 / K_CONV
+
+    if 'pmdec_error' in df.columns:
+        df['pmdec_error'] = df['pmdec_error'].fillna(df['pmdec_error'].median())
+    else:
+        df['pmdec_error'] = 0.05 / K_CONV
+
+    # ---- r_proj ----
+    center = SkyCoord(ra=cluster_center_ra * u.deg,
+                      dec=cluster_center_dec * u.deg,
+                      frame='icrs')
+    sc = SkyCoord(ra=df['ra'].values * u.deg,
+                  dec=df['dec'].values * u.deg,
+                  frame='icrs')
+    df['r_proj'] = sc.separation(center).rad * DIST_PC
+
+    print(f"      Base sample size: {len(df)}")
+    print(f"      Photometric binary fraction: {df['is_phot_binary'].mean():.2%}")
+    print(f"      RUWE>1.4 fraction: {(df['ruwe'] > 1.4).mean():.2%}")
+    print(f"      Radius range: {df['r_proj'].min():.2f} -- {df['r_proj'].max():.2f} pc")
+
+    return df
+
+
+# ======================================
+# 2. binary 定义模式
+# ======================================
+def assign_binary_definition(df, mode='combined'):
+    """
+    根据不同模式生成 is_binary 列，并重新做单星去心速度。
+    模式:
+      - photometric
+      - ruwe
+      - combined
+      - overlap
+    """
+    out = df.copy()
+
+    if mode == 'photometric':
+        out['is_binary'] = out['is_phot_binary']
+    elif mode == 'ruwe':
+        out['is_binary'] = (out['ruwe'] > 1.4)
+    elif mode == 'combined':
+        out['is_binary'] = out['is_phot_binary'] | (out['ruwe'] > 1.4)
+    elif mode == 'overlap':
+        out['is_binary'] = out['is_phot_binary'] & (out['ruwe'] > 1.4)
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    # ---- 用该模式下的 single stars 去心 ----
+    single_mask = ~out['is_binary']
+    if single_mask.sum() < 10:
+        pmra_med = out['pmra'].median()
+        pmdec_med = out['pmdec'].median()
+    else:
+        pmra_med = out.loc[single_mask, 'pmra'].median()
+        pmdec_med = out.loc[single_mask, 'pmdec'].median()
+
+    out['v_ra_res'] = K_CONV * (out['pmra'] - pmra_med)
+    out['v_dec_res'] = K_CONV * (out['pmdec'] - pmdec_med)
+    out['v_ra_err'] = K_CONV * out['pmra_error']
+    out['v_dec_err'] = K_CONV * out['pmdec_error']
+
+    return out
+
+
+# ======================================
+# 3. 速度方差估计
+# ======================================
+def robust_sigma2_2d(vx, vy, errx=None, erry=None):
+    vx = np.asarray(vx, dtype=float)
+    vy = np.asarray(vy, dtype=float)
+
+    mask = np.isfinite(vx) & np.isfinite(vy)
+    vx = vx[mask]
+    vy = vy[mask]
+
+    if len(vx) < 3:
+        return np.nan
+
+    varx = np.var(vx, ddof=1)
+    vary = np.var(vy, ddof=1)
+
+    if errx is not None and erry is not None:
+        errx = np.asarray(errx, dtype=float)[mask]
+        erry = np.asarray(erry, dtype=float)[mask]
+        varx -= np.nanmean(errx**2)
+        vary -= np.nanmean(erry**2)
+
+    varx = max(varx, 1e-8)
+    vary = max(vary, 1e-8)
+
+    return 0.5 * (varx + vary)
+
+
+# ======================================
+# 4. 单bin测量
+# ======================================
+def compute_delta_once(df_sub):
+    singles = df_sub[~df_sub['is_binary']]
+    binaries = df_sub[df_sub['is_binary']]
+
+    n_s = len(singles)
+    n_b = len(binaries)
+    n_t = len(df_sub)
+
+    if n_s < 3 or n_b < 3:
         return None
 
-    numeric_cols = ['ra', 'dec', 'parallax', 'parallax_error', 'pmra', 'pmra_error',
-                    'pmdec', 'pmdec_error', 'ruwe', 'M1', 'q', 'Pb']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+    sig2_s = robust_sigma2_2d(
+        singles['v_ra_res'], singles['v_dec_res'],
+        singles['v_ra_err'], singles['v_dec_err']
+    )
+    sig2_b = robust_sigma2_2d(
+        binaries['v_ra_res'], binaries['v_dec_res'],
+        binaries['v_ra_err'], binaries['v_dec_err']
+    )
 
-    required = ['ra', 'dec', 'parallax', 'pmra', 'pmdec', 'M1', 'Pb']
-    df = df.dropna(subset=required)
-    df = df[df['parallax'] > 0]
+    if not np.isfinite(sig2_s) or not np.isfinite(sig2_b) or sig2_s <= 0:
+        return None
 
-    # 贝叶斯修正视差 (Liu+2025 附录)
-    pi_c = 7.41          # 集群平均视差 (mas)
-    sigma_pi_c = 0.17    # 内在弥散 (mas)
-    w_obs = df['parallax'].values
-    sigma_obs = df.get('parallax_error', 0.1 * np.ones_like(w_obs))
-    w_adj = (pi_c / sigma_pi_c**2 + w_obs / sigma_obs**2) / (1/sigma_pi_c**2 + 1/sigma_obs**2)
-    df['parallax_adj'] = w_adj
-    df['dist_pc'] = 1000.0 / w_adj
+    f_b = n_b / n_t
+    delta_kin = (sig2_b - sig2_s) / sig2_s
+    sdyn_eff = delta_kin / f_b if f_b > 0.02 else np.nan
 
-    # 系统质量
-    df['System_Mass'] = df['M1']
-    binary_idx = (df['Pb'] >= 0.5) & (df['q'].notna())
-    df.loc[binary_idx, 'System_Mass'] = df['M1'] * (1 + df['q'])
+    return {
+        'sig2_single': sig2_s,
+        'sig2_binary': sig2_b,
+        'f_b': f_b,
+        'Delta_kin': delta_kin,
+        'Sdyn_eff': sdyn_eff,
+        'N_all': n_t,
+        'N_single': n_s,
+        'N_binary': n_b
+    }
 
-    # 纯净样本定义
-    df['Sample'] = 'intermediate'
-    df.loc[(df['Pb'] < 0.2) & (df['ruwe'] < 1.4), 'Sample'] = 'single'
-    df.loc[df['Pb'] > 0.7, 'Sample'] = 'binary'
 
-    return df
+# ======================================
+# 5. bootstrap + permutation
+# ======================================
+def infer_delta_significance(bin_df, n_boot=2000, n_perm=2000,
+                             min_single=5, min_binary=5, random_state=42):
+    rng = np.random.default_rng(random_state)
 
-# ==========================================
-# 2. 动力学解算（使用修正距离）
-# ==========================================
-def calculate_dynamics(df):
-    print(">>> Calculating Cluster Dynamics with distance correction...")
-    single_mask = df['Sample'] == 'single'
-    c_ra = df.loc[single_mask, 'ra'].median()
-    c_dec = df.loc[single_mask, 'dec'].median()
-    c_pmra = df.loc[single_mask, 'pmra'].median()
-    c_pmdec = df.loc[single_mask, 'pmdec'].median()
+    obs = compute_delta_once(bin_df)
+    if obs is None:
+        return None
 
-    center_coord = SkyCoord(ra=c_ra*u.deg, dec=c_dec*u.deg)
-    star_coords = SkyCoord(ra=df['ra'].values*u.deg, dec=df['dec'].values*u.deg)
+    if obs['N_single'] < min_single or obs['N_binary'] < min_binary:
+        return None
 
-    # 投影半径（个体距离）
-    sep_deg = center_coord.separation(star_coords).degree
-    df['R_pc'] = np.tan(np.radians(sep_deg)) * df['dist_pc']
+    singles = bin_df[~bin_df['is_binary']].copy()
+    binaries = bin_df[bin_df['is_binary']].copy()
 
-    # 相对坐标
-    cos_dec = np.cos(np.radians(c_dec))
-    df['X_pc'] = (df['ra'] - c_ra) * cos_dec * (df['dist_pc'] * np.pi / 180)
-    df['Y_pc'] = (df['dec'] - c_dec) * (df['dist_pc'] * np.pi / 180)
+    n_s = len(singles)
+    n_b = len(binaries)
 
-    k = 4.74047
-    df['v_east'] = k * (df['pmra'] - c_pmra) / df['parallax_adj']
-    df['v_north'] = k * (df['pmdec'] - c_pmdec) / df['parallax_adj']
-    df['v_tan'] = np.sqrt(df['v_east']**2 + df['v_north']**2)
+    s_idx = np.arange(n_s)
+    b_idx = np.arange(n_b)
 
-    pa_rad = center_coord.position_angle(star_coords).radian
-    sin_pa, cos_pa = np.sin(pa_rad), np.cos(pa_rad)
-    df['v_rad'] = df['v_east'] * sin_pa + df['v_north'] * cos_pa
-    df['v_tan_rot'] = df['v_east'] * cos_pa - df['v_north'] * sin_pa
+    boot_delta = []
+    boot_eff = []
+    boot_sig2s = []
+    boot_sig2b = []
+    boot_fb = []
 
-    return df
+    for _ in range(n_boot):
+        s_pick = rng.choice(s_idx, size=n_s, replace=True)
+        b_pick = rng.choice(b_idx, size=n_b, replace=True)
 
-# ==========================================
-# 3. 辅助函数：bootstrap 标准差
-# ==========================================
-def bootstrap_std(data, n_bootstrap=1000):
-    if len(data) < 3:
-        return np.nan, np.nan
-    orig_std = np.std(data, ddof=1)
-    boot_stds = []
-    for _ in range(n_bootstrap):
-        sample = np.random.choice(data, size=len(data), replace=True)
-        boot_stds.append(np.std(sample, ddof=1))
-    return orig_std, np.std(boot_stds)
+        s_bs = singles.iloc[s_pick]
+        b_bs = binaries.iloc[b_pick]
+        all_bs = pd.concat([s_bs, b_bs], ignore_index=True)
 
-# ==========================================
-# 4. 独立图版绘制函数
-# ==========================================
+        tmp = compute_delta_once(all_bs)
+        if tmp is not None and np.isfinite(tmp['Delta_kin']):
+            boot_delta.append(tmp['Delta_kin'])
+            boot_sig2s.append(tmp['sig2_single'])
+            boot_sig2b.append(tmp['sig2_binary'])
+            boot_fb.append(tmp['f_b'])
+            if np.isfinite(tmp['Sdyn_eff']):
+                boot_eff.append(tmp['Sdyn_eff'])
 
-def plot_panel_A(df, save_path):
-    """Panel A: 质量匹配后的径向分布 CDF（无标题）"""
-    single = df[df['Sample'] == 'single'].copy()
-    binary = df[df['Sample'] == 'binary'].copy()
+    if len(boot_delta) < 50:
+        return None
 
-    mass_min, mass_max = binary['System_Mass'].min(), binary['System_Mass'].max()
-    single_in_range = single[(single['System_Mass'] >= mass_min) &
-                             (single['System_Mass'] <= mass_max)]
-    if len(single_in_range) < len(binary):
-        single_matched = single_in_range.sample(n=len(binary), replace=True)
+    boot_delta = np.array(boot_delta)
+    boot_sig2s = np.array(boot_sig2s)
+    boot_sig2b = np.array(boot_sig2b)
+    boot_fb = np.array(boot_fb)
+    boot_eff = np.array(boot_eff) if len(boot_eff) > 0 else np.array([])
+
+    d16, d50, d84 = np.percentile(boot_delta, [16, 50, 84])
+    d025, d975 = np.percentile(boot_delta, [2.5, 97.5])
+    p_boot_gt0 = np.mean(boot_delta > 0)
+    d_err = np.std(boot_delta, ddof=1)
+
+    perm_delta = []
+    values = bin_df.copy()
+    n_total = len(values)
+    n_binary = obs['N_binary']
+
+    for _ in range(n_perm):
+        shuffled = values.copy()
+        rand_labels = np.zeros(n_total, dtype=bool)
+        rand_labels[rng.choice(np.arange(n_total), size=n_binary, replace=False)] = True
+        shuffled['is_binary'] = rand_labels
+
+        tmp = compute_delta_once(shuffled)
+        if tmp is not None and np.isfinite(tmp['Delta_kin']):
+            perm_delta.append(tmp['Delta_kin'])
+
+    if len(perm_delta) < 50:
+        return None
+
+    perm_delta = np.array(perm_delta)
+
+    p_perm_one = (np.sum(perm_delta >= obs['Delta_kin']) + 1) / (len(perm_delta) + 1)
+    p_perm_two = (np.sum(np.abs(perm_delta) >= abs(obs['Delta_kin'])) + 1) / (len(perm_delta) + 1)
+
+    perm_std = np.std(perm_delta, ddof=1)
+    z_like = ((obs['Delta_kin'] - np.mean(perm_delta)) / perm_std) if perm_std > 0 else np.nan
+
+    if p_perm_one < 0.001:
+        sig_flag = '***'
+    elif p_perm_one < 0.01:
+        sig_flag = '**'
+    elif p_perm_one < 0.05:
+        sig_flag = '*'
     else:
-        single_matched = single_in_range.sample(n=len(binary), replace=False)
+        sig_flag = 'ns'
 
-    r_single = np.sort(single_matched['R_pc'])
-    r_binary = np.sort(binary['R_pc'])
-    y_single = np.arange(1, len(r_single)+1) / len(r_single)
-    y_binary = np.arange(1, len(r_binary)+1) / len(r_binary)
+    return {
+        'sig2_single': obs['sig2_single'],
+        'sig2_single_err': np.std(boot_sig2s, ddof=1),
+        'sig2_binary': obs['sig2_binary'],
+        'sig2_binary_err': np.std(boot_sig2b, ddof=1),
+        'f_b': obs['f_b'],
+        'f_b_err': np.std(boot_fb, ddof=1),
+        'Delta_kin': obs['Delta_kin'],
+        'Delta_kin_err': d_err,
+        'Delta_kin_med': d50,
+        'Delta_kin_lo68': d16,
+        'Delta_kin_hi68': d84,
+        'Delta_kin_lo95': d025,
+        'Delta_kin_hi95': d975,
+        'P_boot_gt0': p_boot_gt0,
+        'Sdyn_eff': obs['Sdyn_eff'],
+        'Sdyn_eff_err': np.std(boot_eff, ddof=1) if len(boot_eff) > 10 else np.nan,
+        'p_perm_one': p_perm_one,
+        'p_perm_two': p_perm_two,
+        'z_like': z_like,
+        'sig_flag': sig_flag,
+        'N_all': obs['N_all'],
+        'N_single': obs['N_single'],
+        'N_binary': obs['N_binary']
+    }
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(r_single, y_single, color='#2C7BB6', lw=2.5, label='Singles (mass-matched)')
-    ax.plot(r_binary, y_binary, color='#D7191C', lw=2.5, label='Binaries')
 
-    ks_stat, p_val = stats.ks_2samp(r_single, r_binary)
-    ax.text(0.05, 0.9, f'KS test: p = {p_val:.2e}', transform=ax.transAxes,
-            fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+# ======================================
+# 6. 径向剖面
+# ======================================
+def compute_radial_heating_profiles_significance(df,
+                                                 r_min=0.2,
+                                                 r_max=10.0,
+                                                 bins_num=8,
+                                                 n_boot=2000,
+                                                 n_perm=2000,
+                                                 min_per_bin=12,
+                                                 min_single=5,
+                                                 min_binary=5):
+    bins = np.logspace(np.log10(r_min), np.log10(r_max), bins_num + 1)
+    r_centers = 0.5 * (bins[:-1] + bins[1:])
 
-    ax.set_xscale('log')
-    ax.set_xlabel('Projected radius $R$ (pc)', fontsize=14)
-    ax.set_ylabel('Cumulative fraction', fontsize=14)
-    ax.legend(loc='lower right', fontsize=12)
-    ax.grid(True, which='both', linestyle='--', alpha=0.4)
-    ax.set_xlim(0.1, 10)
-    ax.set_ylim(0, 1)
+    rows = []
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f">>> Panel A saved as '{save_path}'")
+    for i in range(bins_num):
+        r1, r2 = bins[i], bins[i+1]
+        mask = (df['r_proj'] >= r1) & (df['r_proj'] < r2)
+        sub = df.loc[mask].copy()
 
-def plot_panel_B(df, save_path):
-    """Panel B: 速度弥散 vs 系统质量（折线风格 + bootstrap误差）"""
-    core_mask = df['R_pc'] < 2.0
-    single = df[(df['Sample'] == 'single') & core_mask].copy()
-    binary = df[(df['Sample'] == 'binary') & core_mask].copy()
-
-    mass_bins = np.linspace(0.2, 1.4, 6)
-    bin_centers = 0.5 * (mass_bins[:-1] + mass_bins[1:])
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    def compute_binned_stats(subset, label, color, marker):
-        subset['mass_bin'] = pd.cut(subset['System_Mass'], mass_bins, right=False)
-        x_vals, y_vals, y_errs = [], [], []
-        for i, interval in enumerate(subset['mass_bin'].cat.categories):
-            in_bin = subset[subset['mass_bin'] == interval]
-            if len(in_bin) < 5:
-                continue
-            std_val, std_err = bootstrap_std(in_bin['v_tan'].values)
-            x_vals.append(bin_centers[i])
-            y_vals.append(std_val)
-            y_errs.append(std_err)
-        x_vals = np.array(x_vals)
-        y_vals = np.array(y_vals)
-        y_errs = np.array(y_errs)
-        # 使用带连线的 errorbar (fmt='-o' 等)
-        ax.errorbar(x_vals, y_vals, yerr=y_errs, fmt=f'-{marker}', color=color,
-                    label=label, capsize=4, markersize=8, elinewidth=1.5)
-
-    compute_binned_stats(single, 'Singles', '#2C7BB6', 'o')
-    compute_binned_stats(binary, 'Binaries', '#D7191C', 's')
-
-    # 加权幂律拟合（同前）
-    single_binned = []
-    single['mass_bin'] = pd.cut(single['System_Mass'], mass_bins, right=False)
-    for i, interval in enumerate(single['mass_bin'].cat.categories):
-        in_bin = single[single['mass_bin'] == interval]
-        if len(in_bin) < 5:
+        if len(sub) < min_per_bin:
             continue
-        std_val, std_err = bootstrap_std(in_bin['v_tan'].values)
-        single_binned.append({'mass': bin_centers[i], 'std': std_val, 'err': std_err})
-    if len(single_binned) >= 3:
-        x = np.array([d['mass'] for d in single_binned])
-        y = np.array([d['std'] for d in single_binned])
-        w = 1.0 / np.array([d['err']**2 for d in single_binned])
-        logx = np.log10(x)
-        logy = np.log10(y)
-        w_log = w * (y**2)
-        a, b = np.polyfit(logx, logy, 1, w=w_log)
-        eta = -a * 2
-        x_fit = np.linspace(0.3, 1.3, 100)
-        logy_fit = a * np.log10(x_fit) + b
-        y_fit = 10**logy_fit
-        ax.plot(x_fit, y_fit, '--', color='#2C7BB6', lw=2,
-                label=rf'Fit: $\eta={eta:.2f}$')
 
-    ax.set_xlabel(r'System mass $M_{\mathrm{sys}}$ ($M_\odot$)', fontsize=14)
-    ax.set_ylabel(r'Velocity dispersion $\sigma_v$ (km/s)', fontsize=14)
-    ax.legend(loc='upper right', fontsize=12)
-    ax.grid(True, linestyle='--', alpha=0.4)
-    ax.set_xlim(0.2, 1.4)
-    ax.set_ylim(0.2, 0.8)
+        out = infer_delta_significance(
+            sub,
+            n_boot=n_boot,
+            n_perm=n_perm,
+            min_single=min_single,
+            min_binary=min_binary,
+            random_state=1000 + i
+        )
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        if out is None:
+            continue
+
+        rows.append([
+            r_centers[i], r1, r2,
+            out['Delta_kin'], out['Delta_kin_err'],
+            out['Delta_kin_med'], out['Delta_kin_lo68'], out['Delta_kin_hi68'],
+            out['Delta_kin_lo95'], out['Delta_kin_hi95'],
+            out['P_boot_gt0'],
+            out['Sdyn_eff'], out['Sdyn_eff_err'],
+            out['f_b'], out['f_b_err'],
+            out['sig2_single'], out['sig2_single_err'],
+            out['sig2_binary'], out['sig2_binary_err'],
+            out['p_perm_one'], out['p_perm_two'],
+            out['z_like'], out['sig_flag'],
+            out['N_all'], out['N_single'], out['N_binary']
+        ])
+
+    cols = [
+        'R', 'R_in', 'R_out',
+        'Delta_kin', 'Delta_kin_err',
+        'Delta_kin_med', 'Delta_kin_lo68', 'Delta_kin_hi68',
+        'Delta_kin_lo95', 'Delta_kin_hi95',
+        'P_boot_gt0',
+        'Sdyn_eff', 'Sdyn_eff_err',
+        'f_b', 'f_b_err',
+        'sig2_single', 'sig2_single_err',
+        'sig2_binary', 'sig2_binary_err',
+        'p_perm_one', 'p_perm_two',
+        'z_like', 'sig_flag',
+        'N_all', 'N_single', 'N_binary'
+    ]
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+# ======================================
+# 7. 单模式绘图
+# ======================================
+def plot_heating_profiles_significance(res_df, mode_label='combined',
+                                       savefile='heating_profile.pdf'):
+    if len(res_df) == 0:
+        print(f"[Warning] Empty result for mode={mode_label}")
+        return
+
+    fig, axes = plt.subplots(4, 1, figsize=(8, 14), sharex=True)
+    plt.subplots_adjust(hspace=0.08)
+
+    ax1, ax2, ax3, ax4 = axes
+    R = res_df['R'].values
+
+    # panel 1
+    ax1.errorbar(
+        R, res_df['Delta_kin'], yerr=res_df['Delta_kin_err'],
+        fmt='o', color='crimson', markersize=7, capsize=4,
+        elinewidth=1.4, markeredgecolor='black'
+    )
+    ax1.plot(R, res_df['Delta_kin'], color='crimson', alpha=0.35, lw=2)
+    ax1.axhline(0, color='black', ls='--', alpha=0.6)
+    ax1.axvspan(0, 1.5, color='gold', alpha=0.10)
+    ax1.set_ylabel(r'$\Delta_{\rm kin}$', fontsize=14)
+    ax1.set_title(f'Pleiades Binary Heating: {mode_label}', fontsize=15, pad=10)
+
+    yscale = np.nanmax(np.abs(res_df['Delta_kin'])) if len(res_df) > 0 else 1.0
+    if not np.isfinite(yscale) or yscale == 0:
+        yscale = 1.0
+
+    for _, row in res_df.iterrows():
+        y = row['Delta_kin']
+        dy = row['Delta_kin_err'] if np.isfinite(row['Delta_kin_err']) else 0.0
+        ax1.text(row['R'], y + dy + 0.05 * yscale, row['sig_flag'],
+                 ha='center', va='bottom', fontsize=11)
+
+    # panel 2
+    ax2.plot(R, res_df['P_boot_gt0'], '-o', color='purple', lw=2,
+             markersize=6, markeredgecolor='black')
+    ax2.axhline(0.5, color='gray', ls='--', alpha=0.6)
+    ax2.axhline(0.95, color='green', ls=':', alpha=0.7)
+    ax2.axhline(0.99, color='darkgreen', ls=':', alpha=0.7)
+    ax2.axvspan(0, 1.5, color='gold', alpha=0.10)
+    ax2.set_ylim(-0.02, 1.02)
+    ax2.set_ylabel(r'$P_{\rm boot}(\Delta>0)$', fontsize=13)
+
+    # panel 3
+    ax3.errorbar(
+        R, res_df['Sdyn_eff'], yerr=res_df['Sdyn_eff_err'],
+        fmt='s', color='darkorange', markersize=6, capsize=4,
+        elinewidth=1.4, markeredgecolor='black'
+    )
+    ax3.plot(R, res_df['Sdyn_eff'], color='darkorange', alpha=0.35, lw=2)
+    ax3.axhline(0, color='black', ls='--', alpha=0.6)
+    ax3.axvspan(0, 1.5, color='gold', alpha=0.10)
+    ax3.set_ylabel(r'$S_{\rm dyn}^{\star}$', fontsize=14)
+
+    # panel 4
+    ax4.errorbar(
+        R, res_df['f_b'], yerr=res_df['f_b_err'],
+        fmt='^', color='navy', markersize=6, capsize=4,
+        elinewidth=1.4, markeredgecolor='black'
+    )
+    ax4.plot(R, res_df['f_b'], color='navy', alpha=0.35, lw=2)
+    ax4.axvspan(0, 1.5, color='gold', alpha=0.10)
+    ax4.set_ylabel(r'$f_b$', fontsize=14)
+    ax4.set_xlabel(r'Projected Radius $R$ [pc]', fontsize=14)
+
+    for ax in axes:
+        ax.minorticks_on()
+        ax.grid(which='major', linestyle=':', alpha=0.45)
+
+    plt.savefig(savefile, bbox_inches='tight')
     plt.close()
-    print(f">>> Panel B saved as '{save_path}'")
 
-def plot_panel_C(df, save_path):
-    """Panel C: 各向异性剖面（折线风格 + bootstrap误差）"""
-    r_bins = np.linspace(0, 5, 6)
-    r_centers = 0.5 * (r_bins[:-1] + r_bins[1:])
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+# ======================================
+# 8. 单模式运行
+# ======================================
+def run_single_mode(base_df, mode='combined',
+                    outdir='robustness_outputs',
+                    r_min=0.2, r_max=10.0, bins_num=8,
+                    n_boot=2000, n_perm=2000,
+                    min_per_bin=12, min_single=5, min_binary=5):
+    print(f"\n[Mode] Running mode = {mode}")
 
-    def bootstrap_beta(data, n_bootstrap=500):
-        if len(data) < 6:
-            return np.nan, np.nan
-        s_r = np.std(data['v_rad'], ddof=1)
-        s_t = np.std(data['v_tan_rot'], ddof=1)
-        beta = 1.0 - (s_t**2 / (s_r**2 + 1e-10))
-        betas = []
-        for _ in range(n_bootstrap):
-            boot = data.sample(n=len(data), replace=True)
-            s_r_b = np.std(boot['v_rad'], ddof=1)
-            s_t_b = np.std(boot['v_tan_rot'], ddof=1)
-            beta_b = 1.0 - (s_t_b**2 / (s_r_b**2 + 1e-10))
-            betas.append(beta_b)
-        return beta, np.std(betas)
+    df_mode = assign_binary_definition(base_df, mode=mode)
 
-    def compute_anisotropy(subset, label, color, marker):
-        subset['r_bin'] = pd.cut(subset['R_pc'], r_bins, right=False)
-        x_vals, y_vals, y_errs = [], [], []
-        for i, interval in enumerate(subset['r_bin'].cat.categories):
-            in_bin = subset[subset['r_bin'] == interval]
-            if len(in_bin) < 6:
-                continue
-            beta, beta_err = bootstrap_beta(in_bin)
-            x_vals.append(r_centers[i])
-            y_vals.append(beta)
-            y_errs.append(beta_err)
-        x_vals = np.array(x_vals)
-        y_vals = np.array(y_vals)
-        y_errs = np.array(y_errs)
-        # 使用带连线的 errorbar (fmt='-o')
-        ax.errorbar(x_vals, y_vals, yerr=y_errs, fmt=f'-{marker}', color=color,
-                    label=label, capsize=4, markersize=8, elinewidth=1.5)
+    print(f"      Binary fraction = {df_mode['is_binary'].mean():.2%}")
+    print(f"      N_binary = {df_mode['is_binary'].sum()} / N_total = {len(df_mode)}")
 
-    single = df[df['Sample'] == 'single']
-    binary = df[df['Sample'] == 'binary']
-    compute_anisotropy(single, 'Singles', '#2C7BB6', 'o')
-    compute_anisotropy(binary, 'Binaries', '#D7191C', 's')
+    res_df = compute_radial_heating_profiles_significance(
+        df_mode,
+        r_min=r_min,
+        r_max=r_max,
+        bins_num=bins_num,
+        n_boot=n_boot,
+        n_perm=n_perm,
+        min_per_bin=min_per_bin,
+        min_single=min_single,
+        min_binary=min_binary
+    )
 
-    ax.axhline(0, color='k', ls='--', alpha=0.7)
-    ax.axvspan(0, 2.0, color='gray', alpha=0.15, label='Core region')
-    ax.set_xlabel('Radius $R$ (pc)', fontsize=14)
-    ax.set_ylabel(r'Anisotropy $\beta = 1 - \sigma_t^2 / \sigma_r^2$', fontsize=14)
-    ax.set_ylim(-0.8, 0.8)
-    ax.grid(True, linestyle='--', alpha=0.4)
-    ax.legend(loc='lower right', fontsize=12)
+    table_file = os.path.join(outdir, f'Heating_Profile_{mode}.csv')
+    fig_file = os.path.join(outdir, f'Heating_Profile_{mode}.pdf')
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    res_df.to_csv(table_file, index=False)
+    plot_heating_profiles_significance(res_df, mode_label=mode, savefile=fig_file)
+
+    # 汇总指标
+    if len(res_df) > 0:
+        summary = {
+            'mode': mode,
+            'N_total': len(df_mode),
+            'N_binary_total': int(df_mode['is_binary'].sum()),
+            'binary_fraction_total': df_mode['is_binary'].mean(),
+            'n_valid_bins': len(res_df),
+            'n_sig_p005': int(np.sum(res_df['p_perm_one'] < 0.05)),
+            'n_sig_p001': int(np.sum(res_df['p_perm_one'] < 0.01)),
+            'n_boot95': int(np.sum(res_df['P_boot_gt0'] > 0.95)),
+            'n_boot99': int(np.sum(res_df['P_boot_gt0'] > 0.99)),
+            'mean_delta': np.nanmean(res_df['Delta_kin']),
+            'max_delta': np.nanmax(res_df['Delta_kin']),
+            'max_zlike': np.nanmax(res_df['z_like'])
+        }
+    else:
+        summary = {
+            'mode': mode,
+            'N_total': len(df_mode),
+            'N_binary_total': int(df_mode['is_binary'].sum()),
+            'binary_fraction_total': df_mode['is_binary'].mean(),
+            'n_valid_bins': 0,
+            'n_sig_p005': 0,
+            'n_sig_p001': 0,
+            'n_boot95': 0,
+            'n_boot99': 0,
+            'mean_delta': np.nan,
+            'max_delta': np.nan,
+            'max_zlike': np.nan
+        }
+
+    return df_mode, res_df, summary
+
+
+# ======================================
+# 9. 总览比较图
+# ======================================
+def plot_robustness_comparison(results_dict,
+                               savefile='robustness_outputs/Heating_Profile_Comparison.pdf'):
+    """
+    对比四种 binary 定义下的 Delta_kin(R)
+    """
+    plt.figure(figsize=(8, 6))
+
+    color_map = {
+        'photometric': 'royalblue',
+        'ruwe': 'darkorange',
+        'combined': 'crimson',
+        'overlap': 'seagreen'
+    }
+
+    marker_map = {
+        'photometric': 'o',
+        'ruwe': 's',
+        'combined': '^',
+        'overlap': 'D'
+    }
+
+    for mode, res_df in results_dict.items():
+        if len(res_df) == 0:
+            continue
+
+        plt.errorbar(
+            res_df['R'], res_df['Delta_kin'],
+            yerr=res_df['Delta_kin_err'],
+            fmt=marker_map.get(mode, 'o'),
+            color=color_map.get(mode, 'black'),
+            capsize=3, lw=1.2, markersize=5,
+            label=mode
+        )
+        plt.plot(res_df['R'], res_df['Delta_kin'],
+                 color=color_map.get(mode, 'black'), alpha=0.4)
+
+    plt.axhline(0, color='black', ls='--', alpha=0.6)
+    plt.axvspan(0, 1.5, color='gold', alpha=0.10)
+    plt.xscale('log')
+    plt.xlabel(r'Projected Radius $R$ [pc]')
+    plt.ylabel(r'$\Delta_{\rm kin}$')
+    plt.title('Robustness of Binary Heating Signal to Binary Definition')
+    plt.legend(frameon=False)
+    plt.grid(ls=':', alpha=0.4)
+    plt.savefig(savefile, bbox_inches='tight')
     plt.close()
-    print(f">>> Panel C saved as '{save_path}'")
 
-def plot_panel_D(df, save_path):
-    """Panel D: 双星矢量流图（含速度标尺）"""
-    fig, ax = plt.subplots(figsize=(8, 6))
 
-    # 背景星
-    ax.scatter(df['X_pc'], df['Y_pc'], s=5, c='lightgray', alpha=0.3, edgecolor='none')
+# ======================================
+# 10. 汇总表
+# ======================================
+def save_summary_table(summary_list,
+                       filename='robustness_outputs/Heating_Robustness_Summary.csv'):
+    summary_df = pd.DataFrame(summary_list)
+    summary_df.to_csv(filename, index=False)
+    return summary_df
 
-    binary = df[df['Sample'] == 'binary'].copy()
-    core = binary[binary['R_pc'] < 2.0]
-    halo = binary[binary['R_pc'] >= 2.0]
 
-    # 随机抽样（保持图面清晰）
-    if len(core) > 50:
-        core = core.sample(n=50, random_state=42)
-    if len(halo) > 50:
-        halo = halo.sample(n=50, random_state=42)
+# ======================================
+# 11. 主稳健性批量运行
+# ======================================
+def run_robustness_suite(all_csv='Pleiades_GAIA_ALL.csv',
+                         binary_txt='member.txt',
+                         outdir='robustness_outputs',
+                         modes=('photometric', 'ruwe', 'combined', 'overlap'),
+                         r_min=0.2, r_max=10.0, bins_num=8,
+                         n_boot=2000, n_perm=2000,
+                         min_per_bin=12, min_single=5, min_binary=5):
+    os.makedirs(outdir, exist_ok=True)
 
-    scale = 15
-    q_core = ax.quiver(core['X_pc'], core['Y_pc'],
-                       core['v_east'], core['v_north'],
-                       color='purple', scale=scale, width=0.005,
-                       alpha=0.8, label='Core binaries', pivot='mid')
-    q_halo = ax.quiver(halo['X_pc'], halo['Y_pc'],
-                       halo['v_east'], halo['v_north'],
-                       color='red', scale=scale, width=0.005,
-                       alpha=0.6, label='Halo binaries', pivot='mid')
+    base_df = load_and_preprocess(all_csv, binary_txt)
 
-    # 速度标尺
-    ax.quiver(-5, -5, 5, 0, color='black', scale=scale, width=0.008,
-              headwidth=3, headlength=4, label='5 km/s')
-    ax.text(-5, -5.6, '5 km/s', ha='center', va='top', fontsize=10)
+    results_dict = {}
+    summary_list = []
 
-    circle = plt.Circle((0, 0), 2.0, color='gray', fill=False, ls='--', lw=1.5, label='R=2 pc')
-    ax.add_patch(circle)
+    for mode in modes:
+        df_mode, res_df, summary = run_single_mode(
+            base_df,
+            mode=mode,
+            outdir=outdir,
+            r_min=r_min,
+            r_max=r_max,
+            bins_num=bins_num,
+            n_boot=n_boot,
+            n_perm=n_perm,
+            min_per_bin=min_per_bin,
+            min_single=min_single,
+            min_binary=min_binary
+        )
+        results_dict[mode] = res_df
+        summary_list.append(summary)
 
-    ax.set_xlim(-6, 6)
-    ax.set_ylim(-6, 6)
-    ax.set_xlabel('East–West position (pc)', fontsize=14)
-    ax.set_ylabel('North–South position (pc)', fontsize=14)
-    ax.set_aspect('equal')
-    ax.legend(loc='upper right', fontsize=10, frameon=True, fancybox=False, edgecolor='black')
+    summary_df = save_summary_table(
+        summary_list,
+        filename=os.path.join(outdir, 'Heating_Robustness_Summary.csv')
+    )
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f">>> Panel D saved as '{save_path}'")
+    plot_robustness_comparison(
+        results_dict,
+        savefile=os.path.join(outdir, 'Heating_Profile_Comparison.pdf')
+    )
 
-# ==========================================
-# 5. 主程序
-# ==========================================
+    print("\n===== Robustness Summary =====")
+    print(summary_df)
+
+    return results_dict, summary_df
+
+
+# ======================================
+# 12. main
+# ======================================
 if __name__ == "__main__":
-    file_path = 'pleiades_merged.csv'
-    df = load_and_clean_data(file_path)
-    if df is not None:
-        df = calculate_dynamics(df)
+    results_dict, summary_df = run_robustness_suite(
+        all_csv='Pleiades_GAIA_ALL.csv',
+        binary_txt='member.txt',
+        outdir='robustness_outputs',
+        modes=('photometric', 'ruwe', 'combined', 'overlap'),
+        r_min=0.2,
+        r_max=10.0,
+        bins_num=8,
+        n_boot=2000,
+        n_perm=2000,
+        min_per_bin=12,
+        min_single=5,
+        min_binary=5
+    )
 
-        plot_panel_A(df, 'PanelA_CDF.png')
-        plot_panel_B(df, 'PanelB_Heating.png')
-        plot_panel_C(df, 'PanelC_Anisotropy.png')
-        plot_panel_D(df, 'PanelD_VectorMap.png')
-
-        print(">>> All panels generated successfully.")
+    print("\n[Done] Robustness suite completed.")
