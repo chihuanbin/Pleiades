@@ -52,7 +52,7 @@ This file is the **binary classification and stellar-mass input catalog**.
 
 ---
 
-### 3. `heartbeat_v4.py`
+### 3. `heartbeat_v5_v2.py`
 Main analysis script.
 
 This Python script:
