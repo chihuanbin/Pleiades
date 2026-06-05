@@ -1,6 +1,6 @@
 # Pleiades Binary Dynamics from Gaia DR3
 
-This repository contains data products and analysis scripts for exploring the spatial and kinematic properties of unresolved binaries in the **Pleiades** using **Gaia DR3** member stars and multiband binary-model fitting results.
+This repository is for the paper Kinematic Signatures of a Binary-rich Population in the Pleiades by Chi huanbin. It is associated with the manuscript number AAS75679. This repository contains data products and analysis scripts for exploring the spatial and kinematic properties of unresolved binaries in the **Pleiades** using **Gaia DR3** member stars and multiband binary-model fitting results.
 
 The current workflow combines:
 
